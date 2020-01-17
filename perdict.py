@@ -8,6 +8,7 @@ import re
 
 from absl import app, flags
 from cv2 import cv2
+from genicam.gentl import TimeoutException
 from harvesters.core import Harvester
 from harvesters.util.pfnc import (
     mono_location_formats,
@@ -130,124 +131,118 @@ def get_model_instance_detection(num_classes):
     return model
 
 
-class AcquiredImage:
+class RGB8Image:
     def __init__(
         self, width: int, height: int, data_format: str, image_data: np.ndarray
     ):
-        self.width: int = width
-        self.height: int = height
-        self.data_format: str = data_format
-        self.image_data: np.ndarray = image_data
-        self.processed = False
+        self.image_data: np.ndarray = self._process_image(
+            image_data, data_format, width, height
+        )
 
-    def get_data(self, process: bool = False) -> np.ndarray:
-        if process:
-            self.process_image()
+    def get_height(self):
+        return self.image_data.shape[0]
+
+    def get_width(self):
+        return self.image_data.shape[1]
+
+    def get_channels(self):
+        if len(self.image_data.shape) < 3:
+            return 1
+        return self.image_data.shape[2]
+
+    def get_data(self) -> np.ndarray:
         return self.image_data
 
-    def process_image(self) -> None:
-        if self.processed:
-            return
-
-        if self.data_format in mono_location_formats:
-            self.image_data = self.image_data.reshape(self.height, self.width)
-            self.processed = True
-        elif self.data_format == "BayerRG8":
-            self.image_data = cv2.cvtColor(
-                self.image_data.reshape(self.height, self.width), cv2.COLOR_BayerRG2RGB
+    def _process_image(self, image_data, data_format, width, height) -> np.ndarray:
+        # Convert to RGB8
+        if data_format == "Mono8":
+            return cv2.cvtColor(image_data.reshape(height, width), cv2.COLOR_GRAY2RGB)
+        elif data_format == "BayerRG8":
+            return cv2.cvtColor(
+                image_data.reshape(height, width), cv2.COLOR_BayerRG2RGB
             )
-            self.data_format == "RGB8"
-            self.processed = True
-        elif self.data_format in rgb_formats or self.data_format in bgr_formats:
+        elif data_format == "BayerGR8":
+            return cv2.cvtColor(
+                image_data.reshape(height, width), cv2.COLOR_BayerGR2RGB
+            )
+        elif data_format == "BayerGB8":
+            return cv2.cvtColor(
+                image_data.reshape(height, width), cv2.COLOR_BayerGB2RGB
+            )
+        elif data_format == "BayerBG8":
+            return cv2.cvtColor(
+                image_data.reshape(height, width), cv2.COLOR_BayerBG2RGB
+            )
+        elif data_format == "RGB8":
+            return image_data.reshape(height, width, 3)
 
-            self.image_data = self.image_data.reshape(self.height, self.width, 3)
-
-            if self.data_format in bgr_formats:
-                # Swap every R and B:
-                content = content[:, :, ::-1]
-            self.processed = True
+        elif data_format == "BGR8":
+            return cv2.cvtColor(image_data.reshape(height, width, 3), cv2.COLOR_BGR2RGB)
         else:
-            print("Unsupported pixel format: %s" % self.data_format)
+            print("Unsupported pixel format: %s" % data_format)
+            return None
 
     def get_resized_image(self, target_width: int) -> np.ndarray:
-        resize_ratio = float(target_width / self.width)
+        resize_ratio = float(target_width / self.get_width())
         return cv2.resize(self.image_data, (0, 0), fx=resize_ratio, fy=resize_ratio)
 
     def save(self, file_path: str) -> bool:
         try:
             cv2.imwrite(file_path, self.get_data())
-        except:
+        except FileExistsError:
             return False
         return True
 
 
-def acquire_images(cam, consumer_queues: List[queue.Queue]) -> None:
-    cam.start_image_acquisition()
-    print("Acquisition started.")
-    while not exit_event.is_set():
+def get_newest_image(cam):
+    try:
+        retrieved_image = None
         with cam.fetch_buffer() as buffer:
             component = buffer.payload.components[0]
-            for q in consumer_queues:
-
-                # clear stale images
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    pass
-
-                q.put(
-                    AcquiredImage(
-                        component.width,
-                        component.height,
-                        component.data_format,
-                        component.data.copy(),
-                    )
-                )
-    # tell consumer queues that acquisition has ended
-
-    for q in consumer_queues:
-        # clear stale images
-        try:
-            q.get_nowait()
-        except queue.Empty:
-            pass
-        q.put(None)
-
-    cam.stop_image_acquisition()
-    print("Acquisition Ended.")
+            retrieved_image = RGB8Image(
+                component.width,
+                component.height,
+                component.data_format,
+                component.data.copy(),
+            )
+        return retrieved_image
+    except TimeoutException:
+        print("Timeout ocurred waiting for image.")
+        return None
 
 
-def display_images(acquisition_queue: queue.Queue, display_mutex) -> None:
+def display_images(cam) -> None:
     try:
-        with display_mutex:
-            cv2.namedWindow(DISPLAY_WINDOW_NAME)
-            cv2.moveWindow(DISPLAY_WINDOW_NAME, 0, 0)
+
+        cv2.namedWindow(DISPLAY_WINDOW_NAME)
+        cv2.moveWindow(DISPLAY_WINDOW_NAME, 0, 0)
+
         print("Starting live stream.")
+        cam.start_image_acquisition()
 
         while True:
+            retrieved_image = get_newest_image(cam)
 
-            retrieved_image = acquisition_queue.get(block=True)
             if retrieved_image is None:
                 break
 
-            retrieved_image.process_image()
-            with display_mutex:
-                # print("Show image")
-                cv2.imshow(
-                    DISPLAY_WINDOW_NAME,
-                    retrieved_image.get_resized_image(target_width=720),
-                )
-                cv2.waitKey(1)
+            cv2.imshow(
+                DISPLAY_WINDOW_NAME,
+                retrieved_image.get_resized_image(target_width=720),
+            )
+            keypress = cv2.waitKey(1)
+            if keypress == 27:
+                break
 
     finally:
-        # end acquisition if there are any issues
         exit_event.set()
         print("Ending live stream")
+        cam.stop_image_acquisition()
         cv2.destroyWindow(DISPLAY_WINDOW_NAME)
 
 
 def predict_images(
-    inference_queue: queue.Queue, labels, saved_model_file_path, display_mutex
+    in_queue: queue.Queue, labels, saved_model_file_path, display_mutex
 ) -> None:
     try:
         with display_mutex:
@@ -278,7 +273,7 @@ def predict_images(
 
         while True:
 
-            retrieved_image = inference_queue.get(block=True)
+            retrieved_image = in_queue.get(block=True)
             if retrieved_image is None:
                 break
 
@@ -338,6 +333,11 @@ def predict_images(
 
 
 def apply_camera_settings(cam) -> None:
+    # Configure newest only buffer handling
+    cam.keep_latest = True
+    cam.num_filled_buffers_to_hold = 1
+
+    # Configure frame rate
     cam.remote_device.node_map.AcquisitionFrameRateEnable.value = True
     cam.remote_device.node_map.AcquisitionFrameRate.value = min(
         flags.FLAGS.frame_rate, cam.remote_device.node_map.AcquisitionFrameRate.max
@@ -401,40 +401,20 @@ def main(unused_argv):
 
     apply_camera_settings(cam)
 
-    # Newest only single image queue
-    acquisition_queue = queue.Queue(1)
-    inference_queue = queue.Queue(1)
 
-    display_mutex = threading.Lock()
+    # acquire_thread = threading.Thread(
+    # target=acquire_images, args=(cam, [acquisition_queue, inference_queue],)
+    # )
 
-    acquire_thread = threading.Thread(
-        target=acquire_images, args=(cam, [acquisition_queue, inference_queue],)
-    )
-    display_thread = threading.Thread(
-        target=display_images, args=(acquisition_queue, display_mutex,)
-    )
+    display_thread = threading.Thread(target=display_images, args=(cam,))
 
-    inference_thread = threading.Thread(
-        target=predict_images,
-        args=(inference_queue, labels, saved_model_file_path, display_mutex,),
-    )
-
-    inference_thread.start()
+    # inference_thread.start()
     display_thread.start()
-    acquire_thread.start()
+    # acquire_thread.start()
 
-    # while 1:
-    #     print("Refresh")
-    # with display_mutex:
-    # cv2.waitKey(1)
-    #     if keypress == 27:
-    #         # escape key pressed
-    #         exit_event.set()
-    # print("Exiting")
-
-    inference_thread.join()
+    # inference_thread.join()
     display_thread.join()
-    acquire_thread.join()
+    # acquire_thread.join()
 
     # clean up
     cam.destroy()

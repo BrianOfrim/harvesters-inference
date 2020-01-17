@@ -10,12 +10,7 @@ from absl import app, flags
 from cv2 import cv2
 from genicam.gentl import TimeoutException
 from harvesters.core import Harvester
-from harvesters.util.pfnc import (
-    mono_location_formats,
-    bayer_location_formats,
-    rgb_formats,
-    bgr_formats,
-)
+
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
@@ -26,7 +21,7 @@ import torchvision
 import torchvision.transforms.functional as F
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
-# matplotlib.use("TKAgg")
+matplotlib.use("TKAgg")
 
 MODEL_STATE_ROOT_DIR = "modelState"
 MODEL_STATE_FILE_NAME = "modelState.pt"
@@ -154,33 +149,32 @@ class RGB8Image:
         return self.image_data
 
     def _process_image(self, image_data, data_format, width, height) -> np.ndarray:
-        # Convert to RGB8
+        # Convert to BGR (on purpose) for matplot lib
         if data_format == "Mono8":
-            return cv2.cvtColor(image_data.reshape(height, width), cv2.COLOR_GRAY2RGB)
+            return cv2.cvtColor(image_data.reshape(height, width), cv2.COLOR_GRAY2BGR)
         elif data_format == "BayerRG8":
             return cv2.cvtColor(
-                image_data.reshape(height, width), cv2.COLOR_BayerRG2RGB
+                image_data.reshape(height, width), cv2.COLOR_BayerRG2BGR
             )
         elif data_format == "BayerGR8":
             return cv2.cvtColor(
-                image_data.reshape(height, width), cv2.COLOR_BayerGR2RGB
+                image_data.reshape(height, width), cv2.COLOR_BayerGR2BGR
             )
         elif data_format == "BayerGB8":
             return cv2.cvtColor(
-                image_data.reshape(height, width), cv2.COLOR_BayerGB2RGB
+                image_data.reshape(height, width), cv2.COLOR_BayerGB2BGR
             )
         elif data_format == "BayerBG8":
             return cv2.cvtColor(
-                image_data.reshape(height, width), cv2.COLOR_BayerBG2RGB
+                image_data.reshape(height, width), cv2.COLOR_BayerBG2BGR
             )
         elif data_format == "RGB8":
-            return image_data.reshape(height, width, 3)
-
-        elif data_format == "BGR8":
             return cv2.cvtColor(image_data.reshape(height, width, 3), cv2.COLOR_BGR2RGB)
+        elif data_format == "BGR8":
+            return image_data.reshape(height, width, 3)
         else:
             print("Unsupported pixel format: %s" % data_format)
-            return None
+            raise ValueError("Unsupported pixel format: %s" % data_format)
 
     def get_resized_image(self, target_width: int) -> np.ndarray:
         resize_ratio = float(target_width / self.get_width())
@@ -209,45 +203,13 @@ def get_newest_image(cam):
     except TimeoutException:
         print("Timeout ocurred waiting for image.")
         return None
+    except ValueError as err:
+        print(err)
+        return None
 
 
-def display_images(cam) -> None:
+def display_images(cam, labels, saved_model_file_path) -> None:
     try:
-
-        cv2.namedWindow(DISPLAY_WINDOW_NAME)
-        cv2.moveWindow(DISPLAY_WINDOW_NAME, 0, 0)
-
-        print("Starting live stream.")
-        cam.start_image_acquisition()
-
-        while True:
-            retrieved_image = get_newest_image(cam)
-
-            if retrieved_image is None:
-                break
-
-            cv2.imshow(
-                DISPLAY_WINDOW_NAME,
-                retrieved_image.get_resized_image(target_width=720),
-            )
-            keypress = cv2.waitKey(1)
-            if keypress == 27:
-                break
-
-    finally:
-        exit_event.set()
-        print("Ending live stream")
-        cam.stop_image_acquisition()
-        cv2.destroyWindow(DISPLAY_WINDOW_NAME)
-
-
-def predict_images(
-    in_queue: queue.Queue, labels, saved_model_file_path, display_mutex
-) -> None:
-    try:
-        with display_mutex:
-            cv2.namedWindow(INFERENCE_WINDOW_NAME)
-            cv2.moveWindow(INFERENCE_WINDOW_NAME, 1024, 0)
 
         device = (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -265,71 +227,69 @@ def predict_images(
 
         model.eval()
 
+        # create plots
+        fig, (im_ax, inference_ax) = plt.subplots(1, 2)
+
         print("Model state loaded")
 
         label_colors = plt.get_cmap("hsv")(np.linspace(0, 0.9, len(labels)))
 
         print("Starting inference")
 
-        while True:
+        print("Starting live stream.")
+        cam.start_image_acquisition()
 
-            retrieved_image = in_queue.get(block=True)
-            if retrieved_image is None:
-                break
+        with torch.no_grad():
+            while True:
+                retrieved_image = get_newest_image(cam)
 
-            retrieved_image.process_image()
+                if retrieved_image is None:
+                    break
 
-            pil_image = F.to_tensor(
-                Image.fromarray((retrieved_image.get_data() / 255.0), mode="RGB")
-            )
+                tensor_image = F.to_tensor(retrieved_image.get_data())
 
-            outputs = model([pil_image])
-            outputs = [
-                {k: v.to(torch.device("cpu")) for k, v in t.items()} for t in outputs
-            ]
+                outputs = model([tensor_image])
+                outputs = [
+                    {k: v.to(torch.device("cpu")) for k, v in t.items()}
+                    for t in outputs
+                ]
 
-            # with display_mutex:
-            #     cv2.imshow(
-            #         INFERENCE_WINDOW_NAME,
-            #         retrieved_image.get_resized_image(target_width=720),
-            #     )
+                # filter out the background labels and scores bellow threshold
+                filtered_output = [
+                    (
+                        outputs[0]["boxes"][j],
+                        outputs[0]["labels"][j],
+                        outputs[0]["scores"][j],
+                    )
+                    for j in range(len(outputs[0]["boxes"]))
+                    if outputs[0]["scores"][j] > flags.FLAGS.threshold
+                    and outputs[0]["labels"][j] > 0
+                ]
 
-            # filter out the background labels and scores bellow threshold
-            filtered_output = [
-                (
-                    outputs[0]["boxes"][j],
-                    outputs[0]["labels"][j],
-                    outputs[0]["scores"][j],
+                inference_boxes, inference_labels, inference_scores = (
+                    zip(*filtered_output) if len(filtered_output) > 0 else ([], [], [])
                 )
-                for j in range(len(outputs[0]["boxes"]))
-                if outputs[0]["scores"][j] > flags.FLAGS.threshold
-                and outputs[0]["labels"][j] > 0
-            ]
 
-            inference_boxes, inference_labels, inference_scores = (
-                zip(*filtered_output) if len(filtered_output) > 0 else ([], [], [])
-            )
+                inference_ax.clear()
+                im_ax.clear()
 
-            # draw_bboxes(
-            #     inference_ax,
-            #     inference_boxes,
-            #     inference_labels,
-            #     labels,
-            #     label_colors,
-            #     inference_scores,
-            # )
+                inference_ax.imshow(F.to_pil_image(tensor_image))
+                im_ax.imshow(retrieved_image.get_data())
 
-            # cv2.waitKey(1)
+                draw_bboxes(
+                    inference_ax,
+                    inference_boxes,
+                    inference_labels,
+                    labels,
+                    label_colors,
+                    inference_scores,
+                )
 
-            # plt.pause(0.001)
-            # if plt.fignum_exists(inference_ax.figure.number):
-            #     inference_ax.figure.canvas.draw()
+                plt.pause(0.001)
 
     finally:
-        # end acquisition if there are any issues
-        exit_event.set()
-        print("Ending inference")
-        # cv2.destroyWindow(INFERENCE_WINDOW_NAME)
+        print("Ending live stream")
+        cam.stop_image_acquisition()
 
 
 def apply_camera_settings(cam) -> None:
@@ -401,20 +361,7 @@ def main(unused_argv):
 
     apply_camera_settings(cam)
 
-
-    # acquire_thread = threading.Thread(
-    # target=acquire_images, args=(cam, [acquisition_queue, inference_queue],)
-    # )
-
-    display_thread = threading.Thread(target=display_images, args=(cam,))
-
-    # inference_thread.start()
-    display_thread.start()
-    # acquire_thread.start()
-
-    # inference_thread.join()
-    display_thread.join()
-    # acquire_thread.join()
+    display_images(cam, labels, saved_model_file_path)
 
     # clean up
     cam.destroy()
